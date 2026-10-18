@@ -1,0 +1,11 @@
+.dart_tool/
+.packages
+.pub-cache/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.firebase/
+.firebaserc
+.env
+.env.*
+!.env.example

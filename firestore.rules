@@ -1,0 +1,79 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userDoc(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+    function hasUserRecord() {
+      return signedIn() && exists(userDoc(request.auth.uid));
+    }
+    function role() {
+      return get(userDoc(request.auth.uid)).data.role;
+    }
+    function isAdmin() { return hasUserRecord() && role() == 'admin'; }
+    function isDeveloper() { return hasUserRecord() && role() == 'developer'; }
+    function isClient() { return hasUserRecord() && role() == 'client'; }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      // New users can only create their own client profile. Role cannot be self-selected.
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'createdAt'])
+        && request.resource.data.uid == uid
+        && request.resource.data.role == 'client';
+      // Only admins can change roles or profiles; users cannot promote themselves.
+      allow update, delete: if isAdmin();
+    }
+
+    match /projects/{projectId} {
+      function projectMember() {
+        return signedIn() && (
+          resource.data.clientId == request.auth.uid ||
+          (resource.data.developerIds is list && request.auth.uid in resource.data.developerIds)
+        );
+      }
+      allow read: if isAdmin() || projectMember();
+      // Clients may create requests assigned to themselves; no client can assign developers.
+      allow create: if isClient()
+        && request.resource.data.clientId == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+          'title', 'description', 'serviceType', 'status', 'clientId',
+          'developerIds', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.status == 'requested'
+        && request.resource.data.developerIds is list
+        && request.resource.data.developerIds.size() == 0;
+      // Admins manage projects; developers can update only projects assigned to them,
+      // and cannot change client ownership or the developer assignment list.
+      allow update: if isAdmin() || (
+        isDeveloper() && projectMember()
+        && resource.data.developerIds is list
+        && request.auth.uid in resource.data.developerIds
+        && request.resource.data.clientId == resource.data.clientId
+        && request.resource.data.developerIds == resource.data.developerIds
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'updatedAt', 'progressNote'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /projects/{projectId}/updates/{updateId} {
+      function parentProject() {
+        return get(/databases/$(database)/documents/projects/$(projectId)).data;
+      }
+      function canSeeProject() {
+        return signedIn() && (
+          isAdmin() ||
+          parentProject().clientId == request.auth.uid ||
+          (parentProject().developerIds is list && request.auth.uid in parentProject().developerIds)
+        );
+      }
+      allow read: if canSeeProject();
+      allow create: if canSeeProject()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['authorId', 'message', 'createdAt']);
+      allow update, delete: if isAdmin();
+    }
+  }
+}
