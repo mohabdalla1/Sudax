@@ -1,79 +1,283 @@
+
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    function signedIn() { return request.auth != null; }
-    function userDoc(uid) {
+
+    // ---------- User helpers ----------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath(uid) {
       return /databases/$(database)/documents/users/$(uid);
     }
+
     function hasUserRecord() {
-      return signedIn() && exists(userDoc(request.auth.uid));
+      return signedIn()
+        && exists(userPath(request.auth.uid));
     }
+
     function role() {
-      return get(userDoc(request.auth.uid)).data.role;
+      return get(userPath(request.auth.uid)).data.role;
     }
-    function isAdmin() { return hasUserRecord() && role() == 'admin'; }
-    function isDeveloper() { return hasUserRecord() && role() == 'developer'; }
-    function isClient() { return hasUserRecord() && role() == 'client'; }
+
+    function isAdmin() {
+      return hasUserRecord()
+        && role() == 'admin';
+    }
+
+    function isDeveloper() {
+      return hasUserRecord()
+        && role() == 'developer';
+    }
+
+    function isClient() {
+      return hasUserRecord()
+        && role() == 'client';
+    }
+
+    function validString(value, maxLength) {
+      return value is string
+        && value.size() > 0
+        && value.size() <= maxLength;
+    }
+
+    function validServiceType(value) {
+      return value in ['web', 'mobile', 'design', 'other'];
+    }
+
+    function validProjectStatus(value) {
+      return value in [
+        'requested',
+        'in_progress',
+        'review',
+        'completed'
+      ];
+    }
+
+    function validDeveloperIds(value) {
+      return value is list
+        && value.size() <= 20;
+    }
+
+    // ---------- User profiles ----------
 
     match /users/{uid} {
-      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
-      // New users can only create their own client profile. Role cannot be self-selected.
-      allow create: if signedIn() && request.auth.uid == uid
-        && request.resource.data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'createdAt'])
-        && request.resource.data.uid == uid
-        && request.resource.data.role == 'client';
-      // Only admins can change roles or profiles; users cannot promote themselves.
-      allow update, delete: if isAdmin();
-    }
 
-    match /projects/{projectId} {
-      function projectMember() {
-        return signedIn() && (
-          resource.data.clientId == request.auth.uid ||
-          (resource.data.developerIds is list && request.auth.uid in resource.data.developerIds)
+      allow read: if signedIn()
+        && (
+          request.auth.uid == uid
+          || isAdmin()
         );
-      }
-      allow read: if isAdmin() || projectMember();
-      // Clients may create requests assigned to themselves; no client can assign developers.
-      allow create: if isClient()
-        && request.resource.data.clientId == request.auth.uid
-        && request.resource.data.keys().hasOnly([
-          'title', 'description', 'serviceType', 'status', 'clientId',
-          'developerIds', 'createdAt', 'updatedAt'
+
+      // Registration through main.dart creates client accounts only.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasAll([
+          'uid',
+          'email',
+          'displayName',
+          'role',
+          'createdAt'
         ])
-        && request.resource.data.status == 'requested'
-        && request.resource.data.developerIds is list
-        && request.resource.data.developerIds.size() == 0;
-      // Admins manage projects; developers can update only projects assigned to them,
-      // and cannot change client ownership or the developer assignment list.
-      allow update: if isAdmin() || (
-        isDeveloper() && projectMember()
-        && resource.data.developerIds is list
-        && request.auth.uid in resource.data.developerIds
-        && request.resource.data.clientId == resource.data.clientId
-        && request.resource.data.developerIds == resource.data.developerIds
-        && request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(['status', 'updatedAt', 'progressNote'])
-      );
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'email',
+          'displayName',
+          'role',
+          'createdAt'
+        ])
+        && request.resource.data.uid == uid
+        && validString(request.resource.data.email, 254)
+        && validString(request.resource.data.displayName, 100)
+        && request.resource.data.role == 'client'
+        && request.resource.data.createdAt is timestamp;
+
+      // Only an existing admin can manage user profiles or roles.
+      allow update: if isAdmin()
+        && request.resource.data.keys().hasAll([
+          'uid',
+          'email',
+          'displayName',
+          'role',
+          'createdAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'email',
+          'displayName',
+          'role',
+          'createdAt'
+        ])
+        && request.resource.data.uid == uid
+        && request.resource.data.email is string
+        && request.resource.data.displayName is string
+        && request.resource.data.role in [
+          'client',
+          'developer',
+          'admin'
+        ]
+        && request.resource.data.createdAt is timestamp;
+
       allow delete: if isAdmin();
     }
 
-    match /projects/{projectId}/updates/{updateId} {
-      function parentProject() {
-        return get(/databases/$(database)/documents/projects/$(projectId)).data;
+    // ---------- Projects ----------
+
+    match /projects/{projectId} {
+
+      function projectMember() {
+        return signedIn()
+          && (
+            resource.data.clientId == request.auth.uid
+            || (
+              resource.data.developerIds is list
+              && request.auth.uid in resource.data.developerIds
+            )
+          );
       }
-      function canSeeProject() {
-        return signedIn() && (
-          isAdmin() ||
-          parentProject().clientId == request.auth.uid ||
-          (parentProject().developerIds is list && request.auth.uid in parentProject().developerIds)
+
+      function validProjectDocument() {
+        return request.resource.data.keys().hasAll([
+          'title',
+          'description',
+          'serviceType',
+          'status',
+          'clientId',
+          'developerIds',
+          'createdAt',
+          'updatedAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'title',
+          'description',
+          'serviceType',
+          'status',
+          'clientId',
+          'developerIds',
+          'createdAt',
+          'updatedAt',
+          'progressNote'
+        ])
+        && validString(request.resource.data.title, 200)
+        && validString(request.resource.data.description, 5000)
+        && validServiceType(request.resource.data.serviceType)
+        && validProjectStatus(request.resource.data.status)
+        && validString(request.resource.data.clientId, 128)
+        && validDeveloperIds(request.resource.data.developerIds)
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp
+        && (
+          !('progressNote' in request.resource.data)
+          || (
+            request.resource.data.progressNote is string
+            && request.resource.data.progressNote.size() <= 5000
+          )
         );
       }
-      allow read: if canSeeProject();
-      allow create: if canSeeProject()
-        && request.resource.data.authorId == request.auth.uid
-        && request.resource.data.keys().hasOnly(['authorId', 'message', 'createdAt']);
-      allow update, delete: if isAdmin();
+
+      allow read: if isAdmin() || projectMember();
+
+      // Clients can create requests only for themselves.
+      // They cannot assign developers or choose another status.
+      allow create: if isClient()
+        && validProjectDocument()
+        && request.resource.data.clientId == request.auth.uid
+        && request.resource.data.status == 'requested'
+        && request.resource.data.developerIds.size() == 0;
+
+      // Admins manage projects; assigned developers can only
+      // change status, updatedAt, and progressNote.
+      allow update: if validProjectDocument()
+        && (
+          isAdmin()
+          || (
+            isDeveloper()
+            && projectMember()
+            && resource.data.developerIds is list
+            && request.auth.uid in resource.data.developerIds
+            && request.resource.data.clientId == resource.data.clientId
+            && request.resource.data.developerIds == resource.data.developerIds
+            && request.resource.data.title == resource.data.title
+            && request.resource.data.description == resource.data.description
+            && request.resource.data.serviceType == resource.data.serviceType
+            && request.resource.data.createdAt == resource.data.createdAt
+            && request.resource.data.diff(resource.data)
+              .affectedKeys()
+              .hasOnly([
+                'status',
+                'updatedAt',
+                'progressNote'
+              ])
+          )
+        );
+
+      allow delete: if isAdmin();
+
+      // ---------- Project updates / activity ----------
+
+      match /updates/{updateId} {
+
+        function parentExists() {
+          return exists(
+            /databases/$(database)/documents/projects/$(projectId)
+          );
+        }
+
+        function parentProject() {
+          return get(
+            /databases/$(database)/documents/projects/$(projectId)
+          ).data;
+        }
+
+        function canReadParent() {
+          return signedIn()
+            && parentExists()
+            && (
+              isAdmin()
+              || parentProject().clientId == request.auth.uid
+              || (
+                parentProject().developerIds is list
+                && request.auth.uid in parentProject().developerIds
+              )
+            );
+        }
+
+        function canWriteUpdate() {
+          return signedIn()
+            && parentExists()
+            && (
+              isAdmin()
+              || (
+                isDeveloper()
+                && parentProject().developerIds is list
+                && request.auth.uid in parentProject().developerIds
+              )
+            );
+        }
+
+        allow read: if canReadParent();
+
+        // Only admins and assigned developers can post updates.
+        allow create: if canWriteUpdate()
+          && request.resource.data.keys().hasAll([
+            'authorId',
+            'message',
+            'createdAt'
+          ])
+          && request.resource.data.keys().hasOnly([
+            'authorId',
+            'message',
+            'createdAt'
+          ])
+          && request.resource.data.authorId == request.auth.uid
+          && validString(request.resource.data.message, 5000)
+          && request.resource.data.createdAt is timestamp;
+
+        allow update, delete: if isAdmin();
+      }
     }
   }
 }
